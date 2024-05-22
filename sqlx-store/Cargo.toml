@@ -15,6 +15,7 @@ readme = "README.md"
 [features]
 sqlite = ["sqlx/sqlite"]
 postgres = ["sqlx/postgres"]
+tls = ["sqlx/tls-rustls"]
 mysql = ["sqlx/mysql"]
 
 [dependencies]
