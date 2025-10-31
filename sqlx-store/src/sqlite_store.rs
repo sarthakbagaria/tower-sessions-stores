@@ -68,19 +68,30 @@ impl SqliteStore {
         Ok(())
     }
 
-    async fn id_exists(&self, conn: &mut SqliteConnection, id: &Id) -> session_store::Result<bool> {
+    async fn try_create_with_conn(
+        &self,
+        conn: &mut SqliteConnection,
+        record: &Record,
+    ) -> session_store::Result<bool> {
         let query = format!(
             r#"
-            select exists(select 1 from {table_name} where id = ?)
+            insert or abort into {table_name}
+              (id, data, expiry_date) values (?, ?, ?)
             "#,
             table_name = self.table_name
         );
+        let res = sqlx::query(&query)
+            .bind(record.id.to_string())
+            .bind(rmp_serde::to_vec(record).map_err(SqlxStoreError::Encode)?)
+            .bind(record.expiry_date)
+            .execute(conn)
+            .await;
 
-        Ok(sqlx::query_scalar(&query)
-            .bind(id.to_string())
-            .fetch_one(conn)
-            .await
-            .map_err(SqlxStoreError::Sqlx)?)
+        match res {
+            Ok(_) => Ok(true),
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Ok(false),
+            Err(e) => Err(SqlxStoreError::Sqlx(e).into()),
+        }
     }
 
     async fn save_with_conn(
@@ -99,7 +110,7 @@ impl SqliteStore {
             table_name = self.table_name
         );
         sqlx::query(&query)
-            .bind(&record.id.to_string())
+            .bind(record.id.to_string())
             .bind(rmp_serde::to_vec(record).map_err(SqlxStoreError::Encode)?)
             .bind(record.expiry_date)
             .execute(conn)
@@ -116,7 +127,7 @@ impl ExpiredDeletion for SqliteStore {
         let query = format!(
             r#"
             delete from {table_name}
-            where expiry_date < datetime('now', 'utc')
+            where datetime(expiry_date) < datetime('now')
             "#,
             table_name = self.table_name
         );
@@ -133,10 +144,9 @@ impl SessionStore for SqliteStore {
     async fn create(&self, record: &mut Record) -> session_store::Result<()> {
         let mut tx = self.pool.begin().await.map_err(SqlxStoreError::Sqlx)?;
 
-        while self.id_exists(&mut tx, &record.id).await? {
+        while !self.try_create_with_conn(&mut tx, record).await? {
             record.id = Id::default(); // Generate a new ID
         }
-        self.save_with_conn(&mut tx, record).await?;
 
         tx.commit().await.map_err(SqlxStoreError::Sqlx)?;
 
@@ -180,7 +190,7 @@ impl SessionStore for SqliteStore {
             self.table_name
         );
         sqlx::query(&query)
-            .bind(&session_id.to_string())
+            .bind(session_id.to_string())
             .execute(&self.pool)
             .await
             .map_err(SqlxStoreError::Sqlx)?;
